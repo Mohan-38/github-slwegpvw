@@ -15,6 +15,22 @@
     - Add indexes for performance
 */
 
+-- Drop existing objects in correct order to avoid dependency errors
+DROP TRIGGER IF EXISTS token_cleanup_trigger ON secure_download_tokens;
+DROP FUNCTION IF EXISTS trigger_token_cleanup();
+DROP FUNCTION IF EXISTS generate_secure_token();
+DROP FUNCTION IF EXISTS cleanup_expired_tokens();
+
+-- Drop existing policies if they exist
+DROP POLICY IF EXISTS "Public can create secure tokens" ON secure_download_tokens;
+DROP POLICY IF EXISTS "Public can view active tokens for verification" ON secure_download_tokens;
+DROP POLICY IF EXISTS "Authenticated users can update tokens" ON secure_download_tokens;
+DROP POLICY IF EXISTS "Authenticated users can delete tokens" ON secure_download_tokens;
+
+DROP POLICY IF EXISTS "Anyone can insert download attempts" ON download_attempts;
+DROP POLICY IF EXISTS "Anyone can view download attempts" ON download_attempts;
+DROP POLICY IF EXISTS "Authenticated users can manage download attempts" ON download_attempts;
+
 -- Create secure_download_tokens table if it doesn't exist
 DO $$ 
 BEGIN
@@ -102,16 +118,6 @@ CREATE INDEX IF NOT EXISTS idx_download_attempts_email ON download_attempts(atte
 ALTER TABLE secure_download_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE download_attempts ENABLE ROW LEVEL SECURITY;
 
--- Drop existing policies if they exist
-DROP POLICY IF EXISTS "Public can create secure tokens" ON secure_download_tokens;
-DROP POLICY IF EXISTS "Public can view active tokens for verification" ON secure_download_tokens;
-DROP POLICY IF EXISTS "Authenticated users can update tokens" ON secure_download_tokens;
-DROP POLICY IF EXISTS "Authenticated users can delete tokens" ON secure_download_tokens;
-
-DROP POLICY IF EXISTS "Anyone can insert download attempts" ON download_attempts;
-DROP POLICY IF EXISTS "Anyone can view download attempts" ON download_attempts;
-DROP POLICY IF EXISTS "Authenticated users can manage download attempts" ON download_attempts;
-
 -- Policies for secure_download_tokens
 CREATE POLICY "Public can create secure tokens"
   ON secure_download_tokens
@@ -157,11 +163,6 @@ CREATE POLICY "Authenticated users can manage download attempts"
   TO authenticated
   USING (true)
   WITH CHECK (true);
-
--- Drop existing functions first to avoid conflicts
-DROP FUNCTION IF EXISTS generate_secure_token();
-DROP FUNCTION IF EXISTS cleanup_expired_tokens();
-DROP FUNCTION IF EXISTS trigger_token_cleanup();
 
 -- Function to generate secure tokens
 CREATE OR REPLACE FUNCTION generate_secure_token()
@@ -221,7 +222,6 @@ END;
 $$;
 
 -- Create trigger for automatic cleanup
-DROP TRIGGER IF EXISTS token_cleanup_trigger ON secure_download_tokens;
 CREATE TRIGGER token_cleanup_trigger
   AFTER INSERT ON secure_download_tokens
   FOR EACH STATEMENT

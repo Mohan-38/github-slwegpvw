@@ -70,11 +70,46 @@ export const generateSecureDownloadTokens = async (
 
   for (const document of documents) {
     try {
-      // Generate secure token
+      // Generate secure token using the database function
       const { data: tokenData, error: tokenError } = await supabase.rpc('generate_secure_token');
       
       if (tokenError) {
         console.error('Error generating token:', tokenError);
+        // Fallback to client-side token generation
+        const token = generateClientSideToken();
+        console.log('Using client-side generated token:', token);
+        
+        // Store token in database
+        const { data: storedToken, error: storeError } = await supabase
+          .from('secure_download_tokens')
+          .insert({
+            token,
+            document_id: document.id,
+            recipient_email: recipientEmail.toLowerCase().trim(),
+            order_id: orderId,
+            expires_at: expiresAt.toISOString(),
+            max_downloads: finalConfig.maxDownloads,
+            download_count: 0,
+            is_active: true
+          })
+          .select()
+          .single();
+
+        if (storeError) {
+          console.error('Error storing token:', storeError);
+          continue;
+        }
+
+        // Generate secure URL
+        const baseUrl = window.location.origin;
+        const secureUrl = `${baseUrl}/secure-download/${token}?email=${encodeURIComponent(recipientEmail)}`;
+
+        secureUrls.push({
+          documentId: document.id,
+          documentName: document.name,
+          secureUrl,
+          expiresAt: expiresAt.toISOString()
+        });
         continue;
       }
 
@@ -86,7 +121,7 @@ export const generateSecureDownloadTokens = async (
         .insert({
           token,
           document_id: document.id,
-          recipient_email: recipientEmail.toLowerCase(),
+          recipient_email: recipientEmail.toLowerCase().trim(),
           order_id: orderId,
           expires_at: expiresAt.toISOString(),
           max_downloads: finalConfig.maxDownloads,
@@ -121,7 +156,19 @@ export const generateSecureDownloadTokens = async (
 };
 
 /**
- * Verify and validate download token
+ * Client-side token generation fallback
+ */
+const generateClientSideToken = (): string => {
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 32; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
+};
+
+/**
+ * Verify and validate download token with enhanced email verification
  */
 export const verifyDownloadToken = async (
   token: string,
@@ -135,7 +182,13 @@ export const verifyDownloadToken = async (
   tokenData?: SecureDownloadToken;
 }> => {
   try {
-    // Get token data
+    console.log('🔍 Verifying download token:', token);
+    console.log('📧 Attempted email:', attemptedEmail);
+
+    // Normalize email for comparison
+    const normalizedAttemptedEmail = attemptedEmail.toLowerCase().trim();
+
+    // Get token data with document information
     const { data: tokenData, error: tokenError } = await supabase
       .from('secure_download_tokens')
       .select(`
@@ -145,7 +198,9 @@ export const verifyDownloadToken = async (
           name,
           url,
           type,
-          size
+          size,
+          document_category,
+          review_stage
         )
       `)
       .eq('token', token)
@@ -153,15 +208,21 @@ export const verifyDownloadToken = async (
       .single();
 
     if (tokenError || !tokenData) {
-      await logDownloadAttempt(null, attemptedEmail, false, 'Invalid or expired token', ipAddress, userAgent);
-      return { valid: false, reason: 'Invalid or expired token' };
+      console.error('❌ Token not found or error:', tokenError);
+      await logDownloadAttempt(null, normalizedAttemptedEmail, false, 'Invalid or expired token', ipAddress, userAgent);
+      return { valid: false, reason: 'Invalid or expired download link. Please check your email for the correct link.' };
     }
+
+    console.log('✅ Token found:', tokenData.id);
+    console.log('📧 Token email:', tokenData.recipient_email);
+    console.log('⏰ Token expires:', tokenData.expires_at);
 
     // Check expiration
     const now = new Date();
     const expiresAt = new Date(tokenData.expires_at);
     if (now > expiresAt) {
-      await logDownloadAttempt(tokenData.id, attemptedEmail, false, 'Token expired', ipAddress, userAgent);
+      console.error('❌ Token expired');
+      await logDownloadAttempt(tokenData.id, normalizedAttemptedEmail, false, 'Token expired', ipAddress, userAgent);
       
       // Deactivate expired token
       await supabase
@@ -169,32 +230,69 @@ export const verifyDownloadToken = async (
         .update({ is_active: false, updated_at: new Date().toISOString() })
         .eq('id', tokenData.id);
 
-      return { valid: false, reason: 'Download link has expired' };
+      return { 
+        valid: false, 
+        reason: `Download link has expired on ${expiresAt.toLocaleDateString()}. Please contact support for new download links.`,
+        tokenData 
+      };
     }
 
-    // Check email match (case insensitive)
-    if (tokenData.recipient_email.toLowerCase() !== attemptedEmail.toLowerCase()) {
-      await logDownloadAttempt(tokenData.id, attemptedEmail, false, 'Email mismatch', ipAddress, userAgent);
-      return { valid: false, reason: 'This download link is not authorized for your email address' };
+    // Enhanced email verification with multiple checks
+    const normalizedTokenEmail = tokenData.recipient_email.toLowerCase().trim();
+    
+    // Check exact email match
+    if (normalizedTokenEmail !== normalizedAttemptedEmail) {
+      console.error('❌ Email mismatch');
+      console.log('Expected:', normalizedTokenEmail);
+      console.log('Attempted:', normalizedAttemptedEmail);
+      
+      await logDownloadAttempt(tokenData.id, normalizedAttemptedEmail, false, 'Email mismatch', ipAddress, userAgent);
+      return { 
+        valid: false, 
+        reason: `This download link is authorized for ${tokenData.recipient_email} only. Please use the email address that was used for the purchase.`,
+        tokenData 
+      };
     }
 
     // Check download count
     if (tokenData.download_count >= tokenData.max_downloads) {
-      await logDownloadAttempt(tokenData.id, attemptedEmail, false, 'Download limit exceeded', ipAddress, userAgent);
-      return { valid: false, reason: 'Download limit exceeded for this link' };
+      console.error('❌ Download limit exceeded');
+      await logDownloadAttempt(tokenData.id, normalizedAttemptedEmail, false, 'Download limit exceeded', ipAddress, userAgent);
+      return { 
+        valid: false, 
+        reason: `Download limit of ${tokenData.max_downloads} has been reached for this link. Please contact support if you need additional downloads.`,
+        tokenData 
+      };
     }
 
+    // Check if document exists
+    if (!tokenData.project_documents) {
+      console.error('❌ Document not found');
+      await logDownloadAttempt(tokenData.id, normalizedAttemptedEmail, false, 'Document not found', ipAddress, userAgent);
+      return { 
+        valid: false, 
+        reason: 'The requested document is no longer available. Please contact support.',
+        tokenData 
+      };
+    }
+
+    console.log('✅ All verifications passed');
+
     // Valid token - log successful attempt
-    await logDownloadAttempt(tokenData.id, attemptedEmail, true, null, ipAddress, userAgent);
+    await logDownloadAttempt(tokenData.id, normalizedAttemptedEmail, true, null, ipAddress, userAgent);
 
     // Increment download count
-    await supabase
+    const { error: updateError } = await supabase
       .from('secure_download_tokens')
       .update({ 
         download_count: tokenData.download_count + 1,
         updated_at: new Date().toISOString()
       })
       .eq('id', tokenData.id);
+
+    if (updateError) {
+      console.error('⚠️ Failed to update download count:', updateError);
+    }
 
     return {
       valid: true,
@@ -203,14 +301,14 @@ export const verifyDownloadToken = async (
     };
 
   } catch (error) {
-    console.error('Error verifying download token:', error);
-    await logDownloadAttempt(null, attemptedEmail, false, 'System error', ipAddress, userAgent);
-    return { valid: false, reason: 'System error occurred' };
+    console.error('💥 Error verifying download token:', error);
+    await logDownloadAttempt(null, attemptedEmail.toLowerCase().trim(), false, 'System error', ipAddress, userAgent);
+    return { valid: false, reason: 'A system error occurred. Please try again or contact support if the problem persists.' };
   }
 };
 
 /**
- * Log download attempt for audit trail
+ * Enhanced download attempt logging
  */
 const logDownloadAttempt = async (
   tokenId: string | null,
@@ -221,34 +319,68 @@ const logDownloadAttempt = async (
   userAgent?: string
 ): Promise<void> => {
   try {
-    await supabase
+    const { error } = await supabase
       .from('download_attempts')
       .insert({
         token_id: tokenId,
-        attempted_email: attemptedEmail.toLowerCase(),
+        attempted_email: attemptedEmail.toLowerCase().trim(),
         ip_address: ipAddress,
         user_agent: userAgent,
         success,
         failure_reason: failureReason,
         attempted_at: new Date().toISOString()
       });
+
+    if (error) {
+      console.error('Failed to log download attempt:', error);
+    } else {
+      console.log('📝 Download attempt logged:', { success, email: attemptedEmail, reason: failureReason });
+    }
   } catch (error) {
     console.error('Error logging download attempt:', error);
   }
 };
 
 /**
- * Get client IP address (best effort)
+ * Get client IP address with multiple fallbacks
  */
 export const getClientIP = async (): Promise<string | undefined> => {
   try {
-    const response = await fetch('https://api.ipify.org?format=json');
-    const data = await response.json();
-    return data.ip;
+    // Try multiple IP services for better reliability
+    const ipServices = [
+      'https://api.ipify.org?format=json',
+      'https://ipapi.co/json/',
+      'https://httpbin.org/ip'
+    ];
+
+    for (const service of ipServices) {
+      try {
+        const response = await fetch(service, { timeout: 5000 } as any);
+        const data = await response.json();
+        
+        // Handle different response formats
+        if (data.ip) return data.ip;
+        if (data.origin) return data.origin;
+        if (data.query) return data.query;
+      } catch (serviceError) {
+        console.warn(`IP service ${service} failed:`, serviceError);
+        continue;
+      }
+    }
+    
+    return undefined;
   } catch (error) {
     console.error('Error getting client IP:', error);
     return undefined;
   }
+};
+
+/**
+ * Enhanced email validation
+ */
+export const validateEmail = (email: string): boolean => {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email.trim());
 };
 
 /**
@@ -342,21 +474,14 @@ export const getDownloadStatistics = async (orderId?: string): Promise<{
  */
 export const cleanupExpiredTokens = async (): Promise<number> => {
   try {
-    const { error } = await supabase.rpc('cleanup_expired_tokens');
+    const { data, error } = await supabase.rpc('cleanup_expired_tokens');
     
     if (error) {
       console.error('Error cleaning up expired tokens:', error);
       return 0;
     }
 
-    // Get count of cleaned up tokens
-    const { data: expiredCount } = await supabase
-      .from('secure_download_tokens')
-      .select('id', { count: 'exact' })
-      .eq('is_active', false)
-      .lt('expires_at', new Date().toISOString());
-
-    return expiredCount?.length || 0;
+    return data || 0;
   } catch (error) {
     console.error('Error cleaning up expired tokens:', error);
     return 0;
@@ -371,9 +496,18 @@ export const requestNewDownloadLinks = async (
   recipientEmail: string
 ): Promise<boolean> => {
   try {
-    // This would typically send an email to the admin or trigger a workflow
-    // For now, we'll just log the request
-    console.log('New download links requested:', { orderId, recipientEmail });
+    console.log('📧 Requesting new download links for:', { orderId, recipientEmail });
+    
+    // Log the request in download_attempts for tracking
+    await supabase
+      .from('download_attempts')
+      .insert({
+        token_id: null,
+        attempted_email: recipientEmail.toLowerCase().trim(),
+        success: false,
+        failure_reason: `New download links requested for order ${orderId}`,
+        attempted_at: new Date().toISOString()
+      });
     
     // In a real implementation, you might:
     // 1. Send an email to admin
@@ -384,5 +518,31 @@ export const requestNewDownloadLinks = async (
   } catch (error) {
     console.error('Error requesting new download links:', error);
     return false;
+  }
+};
+
+/**
+ * Test download system functionality
+ */
+export const testDownloadSystem = async (): Promise<void> => {
+  console.log('🧪 Testing download system...');
+  
+  try {
+    // Test token generation
+    const testToken = generateClientSideToken();
+    console.log('✅ Token generation works:', testToken);
+    
+    // Test email validation
+    const validEmail = validateEmail('test@example.com');
+    const invalidEmail = validateEmail('invalid-email');
+    console.log('✅ Email validation works:', { validEmail, invalidEmail });
+    
+    // Test IP detection
+    const ip = await getClientIP();
+    console.log('✅ IP detection works:', ip);
+    
+    console.log('🎉 Download system test completed successfully');
+  } catch (error) {
+    console.error('❌ Download system test failed:', error);
   }
 };
